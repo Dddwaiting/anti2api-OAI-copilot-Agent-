@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <title>Antigravity OAuth 管理</title>
+  <script>
+    try {
+      const saved = localStorage.getItem('ag-panel-theme');
+      if (saved) document.documentElement.setAttribute('data-theme', saved);
+    } catch (e) { }
+  </script>
+  <link rel="stylesheet" href="/admin/panel.css" />
+  <script src="/admin/theme.js"></script>
+</head>
+
+<body>
+  <div class="container">
+    <header class="header">
+      <div>
+        <h1>Antigravity OAuth 管理</h1>
+        <p>登录后可以完成 Google 授权、刷新或删除凭证，并查看用量和调用日志。</p>
+      </div>
+      <div class="header-actions">
+        <button id="themeToggleBtn" class="refresh-btn" type="button">🌙 暗色模式</button>
+        <button id="logoutBtn" class="refresh-btn">退出登录</button>
+      </div>
+    </header>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab-target="auth">授权</button>
+      <button class="tab-btn" data-tab-target="import">导入</button>
+      <button class="tab-btn" data-tab-target="manage">管理凭证</button>
+      <button class="tab-btn" data-tab-target="usage">凭证用量</button>
+      <button class="tab-btn" data-tab-target="logs">调用日志</button>
+      <button class="tab-btn" data-tab-target="settings">系统设置</button>
+      <button class="tab-btn" data-tab-target="api-docs">API 文档</button>
+      <button class="tab-btn" data-tab-target="project">项目介绍</button>
+    </div>
+
+    <section class="card tab-panel active" data-tab="auth">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">步骤 1</div>
+          <h2>获取授权链接</h2>
+          <p>点击获取授权链接，在新窗口完成 Google 登录。</p>
+        </div>
+        <button id="loginBtn">➕ 获取授权 URL</button>
+      </div>
+      <div class="card-body">
+        <p>授权完成后，请复制回调页面地址栏中的完整 URL，粘贴到输入框并提交以完成添加或重新授权。</p>
+        <input id="callbackUrlInput" type="text" placeholder="将回调后浏览器真实的完整 URL 粘贴到这里" class="input" />
+        <div class="project-id-section">
+          <label class="project-id-label">
+            <span>自定义项目 ID（可选）</span>
+            <input id="customProjectIdInput" type="text" placeholder="输入自定义项目ID，留空则自动获取" class="input" />
+          </label>
+        </div>
+        <label class="checkbox-row">
+          <input type="checkbox" id="allowRandomProjectId" />
+          <span>无法自动获取 Google 项目 ID 时，使用随机 projectId（可能导致 403 错误）！</span>
+        </label>
+        <div class="inline-row">
+          <button id="submitCallbackBtn" class="refresh-btn">提交回调 URL 并交换凭证</button>
+          <span id="status" class="badge" style="display:none;"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card tab-panel" data-tab="import">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">步骤 1.5</div>
+          <h2>批量导入凭证（TOML）</h2>
+          <p>支持一次性导入多个凭证，格式与 <code>accounts</code> 数组表一致。</p>
+        </div>
+        <button id="importTomlBtn">📥 导入 TOML</button>
+      </div>
+      <div class="card-body">
+        <p>将包含 <code>[[accounts]]</code> 的 TOML 内容粘贴到下方，必要时勾选覆盖现有凭证。</p>
+        <textarea id="tomlInput" class="textarea" rows="8" placeholder="[[accounts]]\naccess_token = \"
+          ...\"\nrefresh_token=\"...\"\ncreated_at=\"2025-11-26 08:46:35\"\n..."></textarea>
+        <label class="checkbox-row">
+          <input type="checkbox" id="replaceExisting" />
+          <span>覆盖已存在的账号（勾选后将只保留本次导入的账号）</span>
+        </label>
+        <label class="checkbox-row">
+          <input type="checkbox" id="filterDisabled" checked />
+          <span>仅导入启用的凭证（跳过 disabled = false 的账号）</span>
+        </label>
+        <div class="inline-row">
+          <span id="tomlStatus" class="badge" style="display:none;"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card tab-panel" data-tab="manage">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">步骤 2</div>
+          <h2>管理凭证</h2>
+          <p>刷新、停用、删除或重新授权已保存的账户。</p>
+        </div>
+        <div class="card-actions">
+          <div class="action-group">
+            <button id="refreshAllBtn" class="refresh-btn">🔁 批量刷新</button>
+            <button id="deleteDisabledBtn" class="danger-btn">🗑️ 删除停用凭证</button>
+          </div>
+          <button id="refreshBtn" class="refresh-btn">刷新列表</button>
+        </div>
+      </div>
+      <div class="filter-row">
+        <label class="filter-field">
+          <span>状态筛选</span>
+          <select id="statusFilter" class="input select">
+            <option value="all">全部</option>
+            <option value="enabled">仅启用</option>
+            <option value="disabled">仅停用</option>
+          </select>
+        </label>
+        <label class="filter-field checkbox-row">
+          <input type="checkbox" id="errorFilter" />
+          <span>仅显示有报错的凭证</span>
+        </label>
+      </div>
+      <div class="status-row">
+        <span id="manageStatus" class="badge" style="display:none;"></span>
+      </div>
+      <div class="pagination-bar">
+        <div id="paginationInfo" class="pagination-info">加载中...</div>
+        <div class="pagination-controls">
+          <button id="prevPageBtn" class="mini-btn">上一页</button>
+          <button id="nextPageBtn" class="mini-btn">下一页</button>
+        </div>
+      </div>
+      <div id="accountsList" class="accounts-list">加载中...</div>
+    </section>
+
+    <section class="card tab-panel" data-tab="usage">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">步骤 3</div>
+          <h2>凭证用量</h2>
+          <p>只显示有调用记录的凭证，按最近使用排序，并展示最近一小时的限额进度及累计调用数据。</p>
+        </div>
+        <button id="usageRefreshBtn" class="refresh-btn">🔄 刷新用量</button>
+      </div>
+      <div class="status-row">
+        <span id="usageStatus" class="badge" style="display:none;"></span>
+      </div>
+      <div class="log-usage-card">
+        <div class="log-usage-head">
+          <div>
+            <div class="eyebrow">每小时用量</div>
+            <h3>默认凭证 20 次 / 小时 限额，可以前往设置修改</h3>
+            <p>按浏览器时区计算当前小时的调用占比。</p>
+          </div>
+        </div>
+        <div id="hourlyUsage" class="log-usage-list">加载中...</div>
+      </div>
+    </section>
+
+    <section class="card tab-panel" data-tab="logs">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">调用追踪</div>
+          <h2>调用日志</h2>
+          <p>精确到秒，记录使用的模型以及调用结果。</p>
+        </div>
+        <div class="card-actions">
+          <button id="logsRefreshBtn" class="refresh-btn">🔄 刷新日志</button>
+          <button id="logsClearBtn" class="refresh-btn">🗑 清空日志</button>
+        </div>
+      </div>
+      <div class="logs-body">
+        <div class="pagination-bar logs-pagination">
+          <div id="logPaginationInfo" class="pagination-info">加载中...</div>
+          <div class="pagination-controls">
+            <button id="logPrevPageBtn" class="mini-btn">上一页</button>
+            <button id="logNextPageBtn" class="mini-btn">下一页</button>
+          </div>
+        </div>
+        <div id="logs" class="logs">加载中...</div>
+      </div>
+    </section>
+
+    <section class="card tab-panel" data-tab="settings">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">环境变量</div>
+          <h2>当前配置</h2>
+          <p>查看面板、网络、生成参数和限额配置，敏感信息会自动加密展示。</p>
+        </div>
+        <div class="card-actions">
+          <button id="settingsRefreshBtn" class="refresh-btn">🔄 刷新配置</button>
+        </div>
+      </div>
+      <div class="status-row">
+        <span id="settingsStatus" class="badge" style="display:none;"></span>
+      </div>
+      <div id="settingsGrid" class="settings-grid">加载中...</div>
+    </section>
+
+    <section class="card tab-panel" data-tab="api-docs">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">API 参考</div>
+          <h2>查看全部接口与示例</h2>
+          <p>跳转到独立页面查看 API 端点、请求示例和返回格式，不与控制台页面混合。</p>
+        </div>
+        <div class="card-actions">
+          <a class="refresh-btn" href="/admin/api.html" target="_blank" rel="noopener">↗ 打开 API 文档</a>
+        </div>
+      </div>
+      <div class="card-body">
+        <p>新页面将列出所有可用 API，包括凭证清单、限额说明、OpenAI 兼容的聊天接口以及按凭证固定的免限额调用示例。</p>
+      </div>
+    </section>
+
+    <section class="card tab-panel" data-tab="project">
+      <div class="card-header">
+        <div>
+          <div class="eyebrow">关于项目</div>
+          <h2>项目介绍</h2>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="project-content">
+          <p>当前项目是基于<a href="https://github.com/liuw1535">liuw1535</a>大佬的<a
+              href="https://github.com/liuw1535/antigravity2api-nodejs">antigravity2api-nodejs</a>做的修改和迭代</p>
+          <p>二开项目QQ交流群： <a href="https://qm.qq.com/q/J0Ny6uYZCo">937931004</a></p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/admin/panel.js"></script>
+</body>
+
+</html>
