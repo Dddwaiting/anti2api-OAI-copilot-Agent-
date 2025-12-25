@@ -12,7 +12,7 @@ on:
 env:
   REGISTRY: ghcr.io
   # 使用 github.repository 变量自动获取 "用户名/仓库名"
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME:  dddwaiting/anti2api-oai-copilot-agent
 
 jobs:
   build:
