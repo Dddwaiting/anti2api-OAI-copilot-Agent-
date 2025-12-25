@@ -10,7 +10,10 @@ COPY package.json ./
 # 安装生产环境依赖
 # 使用淘宝源加速构建过程
 RUN npm install --production --registry=https://registry.npmmirror.com
-
+RUN apt-get update && \
+    apt-get install -y ca-certificates && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 # 复制项目源代码
 COPY . .
 
