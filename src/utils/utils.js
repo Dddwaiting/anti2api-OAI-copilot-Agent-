@@ -198,29 +198,71 @@ function convertOpenAIToolsToAntigravity(openaiTools) {
 
   return openaiTools.map((tool) => {
     // 复制一份参数对象，避免修改原始数据
-    const parameters = tool.function.parameters ? { ...tool.function.parameters } : {};
+    const parameters = tool.function?.parameters ? { ...tool.function.parameters } : {};
 
     // 清理 JSON Schema，移除 Gemini 不支持的字段
     const cleanedParameters = cleanJsonSchema(parameters);
 
+    // 确保 name 和 description 有效
+    // 注意：不对 name 进行清理，保持原始名称以确保响应匹配
+    const name = tool.function?.name || 'unknown_function';
+    const description = tool.function?.description || '';
+
     return {
       functionDeclarations: [
         {
-          name: tool.function.name,
-          description: tool.function.description,
+          name: name,  // 保持原始名称，不进行清理
+          description: description,
           parameters: cleanedParameters
         }
       ]
     };
   });
 }
-function cleanJsonSchema(schema) {
+
+/**
+ * 清理函数名称，确保符合 Gemini API 要求
+ * - 只允许字母、数字、下划线
+ * - 不能以数字开头
+ */
+function sanitizeFunctionName(name) {
+  if (!name || typeof name !== 'string') return 'unknown_function';
+  // 替换非法字符为下划线
+  let sanitized = name.replace(/[^a-zA-Z0-9_]/g, '_');
+  // 如果以数字开头，添加前缀
+  if (/^[0-9]/.test(sanitized)) {
+    sanitized = 'fn_' + sanitized;
+  }
+  return sanitized || 'unknown_function';
+}
+
+/**
+ * 清理 JSON Schema，使其兼容 Gemini API
+ * 
+ * 处理的问题类型：
+ * 1. enum 包含空字符串/null/undefined
+ * 2. anyOf/oneOf/allOf 联合类型
+ * 3. const 字段转换
+ * 4. $ref 引用（移除）
+ * 5. 不支持的字段（移除）
+ * 6. 类型不匹配问题
+ * 7. required 包含不存在的属性
+ * 8. 空对象/空数组处理
+ * 9. 循环引用检测
+ */
+function cleanJsonSchema(schema, visited = new WeakSet()) {
+  // 基础类型检查
   if (!schema || typeof schema !== 'object') {
     return schema;
   }
 
+  // 循环引用检测
+  if (visited.has(schema)) {
+    return { type: 'object', description: '[Circular Reference]' };
+  }
+  visited.add(schema);
+
   // Gemini 支持的 JSON Schema 核心字段白名单
-  // [DEBUG] cleanJsonSchema 函数已更新 - 支持 anyOf/oneOf 合并策略
   const SUPPORTED_KEYS = new Set([
     'type',
     'properties',
@@ -229,105 +271,288 @@ function cleanJsonSchema(schema) {
     'description',
     'enum',
     'nullable',
+    'format',      // 部分支持
+    'minimum',     // 数值约束
+    'maximum',
+    'minItems',    // 数组约束
+    'maxItems',
   ]);
 
+  // Gemini 支持的类型
+  const VALID_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object']);
+
   const cleanObject = (obj) => {
-    if (Array.isArray(obj)) {
-      return obj.map(item => (typeof item === 'object' ? cleanObject(item) : item));
+    if (obj === null || obj === undefined) {
+      return null;
     }
 
-    if (obj && typeof obj === 'object') {
-      const cleaned = {};
+    // 循环引用检测（递归调用时也检查）
+    if (typeof obj === 'object' && visited.has(obj)) {
+      return { type: 'object', description: '[Circular Reference]' };
+    }
+    if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
+      visited.add(obj);
+    }
 
-      // 1. 优先处理联合类型 (anyOf/oneOf/allOf) -> 扁平化合并
-      // 解决 VS Code 文件编辑工具使用 anyOf 定义多种操作模式的问题
-      const unionKey = ['anyOf', 'oneOf', 'allOf'].find(key => obj[key] && Array.isArray(obj[key]));
-      if (unionKey) {
-        const options = obj[unionKey];
-        const mergedProperties = {};
-        const mergedEnum = new Set();
-        let hasProps = false;
+    // 处理数组
+    if (Array.isArray(obj)) {
+      return obj
+        .map(item => (typeof item === 'object' && item !== null ? cleanObject(item) : item))
+        .filter(item => item !== null && item !== undefined);
+    }
+
+    if (typeof obj !== 'object') {
+      return obj;
+    }
+
+    const cleaned = {};
+
+    // ========== 1. 处理 $ref 引用 ==========
+    // Gemini 不支持 $ref，直接跳过或返回通用类型
+    if (obj.$ref) {
+      return { type: 'object', description: `Reference: ${obj.$ref}` };
+    }
+
+    // ========== 2. 处理联合类型 (anyOf/oneOf/allOf) ==========
+    const unionKey = ['anyOf', 'oneOf', 'allOf'].find(key => obj[key] && Array.isArray(obj[key]));
+    if (unionKey) {
+      const options = obj[unionKey].filter(opt => opt && typeof opt === 'object');
+      
+      if (options.length === 0) {
+        return { type: 'string', description: obj.description || '' };
+      }
+
+      const mergedProperties = {};
+      const mergedRequired = new Set();
+      const mergedEnum = new Set();
+      const mergedTypes = new Set();
+      let hasProps = false;
+
+      for (const option of options) {
+        const cleanedOption = cleanObject(option);
+        if (!cleanedOption) continue;
+
+        // 收集类型
+        if (cleanedOption.type) {
+          mergedTypes.add(cleanedOption.type);
+        }
+
+        // 合并 properties
+        if (cleanedOption.properties && typeof cleanedOption.properties === 'object') {
+          Object.assign(mergedProperties, cleanedOption.properties);
+          hasProps = true;
+        }
+
+        // 合并 required（仅 allOf 时保留）
+        if (unionKey === 'allOf' && Array.isArray(cleanedOption.required)) {
+          cleanedOption.required.forEach(r => mergedRequired.add(r));
+        }
+
+        // 合并 enum
+        if (Array.isArray(cleanedOption.enum)) {
+          cleanedOption.enum.forEach(v => {
+            if (isValidEnumValue(v)) mergedEnum.add(v);
+          });
+        }
+      }
+
+      // 构建合并后的对象
+      if (hasProps) {
+        cleaned.type = 'object';
+        cleaned.properties = mergedProperties;
         
-        // 遍历所有选项进行合并
-        for (const option of options) {
-          const cleanedOption = cleanObject(option);
-          
-          // 合并 properties
-          if (cleanedOption.properties) {
-            Object.assign(mergedProperties, cleanedOption.properties);
-            hasProps = true;
+        // 验证 required 字段
+        if (mergedRequired.size > 0) {
+          const validRequired = Array.from(mergedRequired).filter(r => 
+            mergedProperties.hasOwnProperty(r)
+          );
+          if (validRequired.length > 0) {
+            cleaned.required = validRequired;
           }
-          
-          // 合并 enum (包括从 const 转换来的)
-          if (cleanedOption.enum) {
-            cleanedOption.enum.forEach(v => mergedEnum.add(v));
-          }
         }
-
-        // 构建合并后的对象
-        if (hasProps) {
-          cleaned.type = 'object';
-          cleaned.properties = mergedProperties;
-          // 注意：合并时我们故意丢弃了 required 字段，
-          // 因为不同分支的必填项合并后应该变为可选，避免逻辑冲突。
-        }
-        
-        if (mergedEnum.size > 0) {
-          if (!cleaned.type) cleaned.type = 'string'; // 默认推断
-          cleaned.enum = Array.from(mergedEnum);
-        }
-
-        // 如果合并后仍然是空的（例如是基础类型的联合，如 string | number），
-        // Gemini 不支持多类型，只好回退到取第一个非空的 cleanedOption
-        if (!hasProps && mergedEnum.size === 0 && options.length > 0) {
-           return cleanObject(options[0]);
-        }
-        
-        // 保留原本 obj 上的描述字段
-        if (obj.description) cleaned.description = obj.description;
-        
-        return cleaned;
+      } else if (mergedEnum.size > 0) {
+        cleaned.type = 'string';
+        cleaned.enum = Array.from(mergedEnum);
+      } else if (mergedTypes.size === 1) {
+        // 只有一种类型
+        cleaned.type = Array.from(mergedTypes)[0];
+      } else if (mergedTypes.size > 1) {
+        // 多种类型，Gemini 不支持，选择最通用的
+        if (mergedTypes.has('string')) cleaned.type = 'string';
+        else if (mergedTypes.has('object')) cleaned.type = 'object';
+        else cleaned.type = Array.from(mergedTypes)[0];
+      } else {
+        // 回退到第一个选项
+        return cleanObject(options[0]);
       }
 
-      // 2. 处理 const -> enum
-      if (obj.const !== undefined) {
-        cleaned.type = typeof obj.const;
-        cleaned.enum = [obj.const];
-        if (obj.description) cleaned.description = obj.description;
-        return cleaned;
-      }
-
-      // 3. 常规字段白名单过滤
-      for (const [key, value] of Object.entries(obj)) {
-        if (SUPPORTED_KEYS.has(key)) {
-          if (key === 'properties' && typeof value === 'object') {
-            const cleanProps = {};
-            for (const [pKey, pValue] of Object.entries(value)) {
-              cleanProps[pKey] = cleanObject(pValue);
-            }
-            cleaned[key] = cleanProps;
-          } else if (key === 'items' && typeof value === 'object') {
-            cleaned[key] = cleanObject(value);
-          } else {
-            cleaned[key] = value;
-          }
-        }
-      }
-
-      // 4. 兜底 type
-      if (!cleaned.type) {
-        if (cleaned.properties) cleaned.type = 'object';
-        else if (cleaned.items) cleaned.type = 'array';
-        else if (cleaned.enum) cleaned.type = 'string';
-      }
-
+      if (obj.description) cleaned.description = String(obj.description);
       return cleaned;
     }
-    return obj;
+
+    // ========== 3. 处理 const -> enum ==========
+    if (obj.const !== undefined) {
+      if (!isValidEnumValue(obj.const)) {
+        cleaned.type = inferType(obj.const);
+        if (obj.description) cleaned.description = String(obj.description);
+        return cleaned;
+      }
+      cleaned.type = inferType(obj.const);
+      cleaned.enum = [obj.const];
+      if (obj.description) cleaned.description = String(obj.description);
+      return cleaned;
+    }
+
+    // ========== 4. 处理 type 字段 ==========
+    if (obj.type) {
+      if (Array.isArray(obj.type)) {
+        // 类型数组，如 ["string", "null"]
+        const validTypes = obj.type.filter(t => VALID_TYPES.has(t));
+        if (validTypes.length === 0) {
+          cleaned.type = 'string';
+        } else if (validTypes.includes('null')) {
+          // 处理 nullable
+          cleaned.type = validTypes.find(t => t !== 'null') || 'string';
+          cleaned.nullable = true;
+        } else {
+          cleaned.type = validTypes[0];
+        }
+      } else if (VALID_TYPES.has(obj.type)) {
+        cleaned.type = obj.type;
+      } else {
+        // 未知类型，映射到最接近的
+        cleaned.type = mapUnknownType(obj.type);
+      }
+    }
+
+    // ========== 5. 常规字段白名单过滤 ==========
+    for (const [key, value] of Object.entries(obj)) {
+      if (!SUPPORTED_KEYS.has(key) || key === 'type') continue;
+
+      if (key === 'properties' && typeof value === 'object' && value !== null) {
+        const cleanProps = {};
+        for (const [pKey, pValue] of Object.entries(value)) {
+          if (pKey && typeof pKey === 'string') {
+            const cleanedProp = cleanObject(pValue);
+            if (cleanedProp) {
+              cleanProps[pKey] = cleanedProp;
+            }
+          }
+        }
+        if (Object.keys(cleanProps).length > 0) {
+          cleaned.properties = cleanProps;
+        }
+      } else if (key === 'items' && typeof value === 'object') {
+        const cleanedItems = cleanObject(value);
+        if (cleanedItems) {
+          cleaned.items = cleanedItems;
+        }
+      } else if (key === 'enum' && Array.isArray(value)) {
+        const filteredEnum = value.filter(isValidEnumValue);
+        if (filteredEnum.length > 0) {
+          cleaned.enum = filteredEnum;
+        }
+      } else if (key === 'required' && Array.isArray(value)) {
+        // 稍后验证
+        cleaned._pendingRequired = value.filter(r => typeof r === 'string' && r.trim() !== '');
+      } else if (key === 'description') {
+        if (value && typeof value === 'string') {
+          cleaned.description = value;
+        } else if (value) {
+          cleaned.description = String(value);
+        }
+      } else if (key === 'nullable') {
+        cleaned.nullable = Boolean(value);
+      } else if (['minimum', 'maximum', 'minItems', 'maxItems'].includes(key)) {
+        if (typeof value === 'number' && !Number.isNaN(value)) {
+          cleaned[key] = value;
+        }
+      } else if (key === 'format' && typeof value === 'string') {
+        // 只保留常用格式
+        const supportedFormats = ['date-time', 'date', 'time', 'email', 'uri', 'uuid'];
+        if (supportedFormats.includes(value)) {
+          cleaned.format = value;
+        }
+      }
+    }
+
+    // ========== 6. 验证 required 字段 ==========
+    if (cleaned._pendingRequired && cleaned.properties) {
+      const validRequired = cleaned._pendingRequired.filter(r => 
+        cleaned.properties.hasOwnProperty(r)
+      );
+      if (validRequired.length > 0) {
+        cleaned.required = validRequired;
+      }
+    }
+    delete cleaned._pendingRequired;
+
+    // ========== 7. 类型推断兜底 ==========
+    if (!cleaned.type) {
+      if (cleaned.properties) cleaned.type = 'object';
+      else if (cleaned.items) cleaned.type = 'array';
+      else if (cleaned.enum) cleaned.type = inferType(cleaned.enum[0]);
+      else cleaned.type = 'string';
+    }
+
+    // ========== 8. 类型一致性验证 ==========
+    if (cleaned.type === 'array' && !cleaned.items) {
+      cleaned.items = { type: 'string' };
+    }
+
+    if (cleaned.type === 'object' && !cleaned.properties) {
+      // 空对象类型，添加空 properties
+      cleaned.properties = {};
+    }
+
+    return cleaned;
   };
 
   return cleanObject(schema);
 }
+
+/**
+ * 检查枚举值是否有效
+ */
+function isValidEnumValue(value) {
+  if (value === null || value === undefined) return false;
+  if (typeof value === 'string' && value.trim() === '') return false;
+  return true;
+}
+
+/**
+ * 推断值的类型
+ */
+function inferType(value) {
+  if (value === null) return 'string';
+  if (typeof value === 'boolean') return 'boolean';
+  if (typeof value === 'number') {
+    return Number.isInteger(value) ? 'integer' : 'number';
+  }
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'object') return 'object';
+  return 'string';
+}
+
+/**
+ * 映射未知类型到 Gemini 支持的类型
+ */
+function mapUnknownType(type) {
+  const typeMap = {
+    'int': 'integer',
+    'float': 'number',
+    'double': 'number',
+    'bool': 'boolean',
+    'str': 'string',
+    'list': 'array',
+    'dict': 'object',
+    'map': 'object',
+    'any': 'string',
+    'null': 'string',
+  };
+  return typeMap[type?.toLowerCase()] || 'string';
+}
+
 /**
  * 生成发送给 Google Antigravity API 的请求体
  * 修复了系统指令合并逻辑，确保 VS Code Copilot 的行为定义不丢失
